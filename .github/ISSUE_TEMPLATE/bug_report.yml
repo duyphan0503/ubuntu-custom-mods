@@ -1,0 +1,62 @@
+name: 🐛 Bug Report
+description: File a bug report to help us improve ubuntu-custom-mods
+title: "[BUG]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a problem! Please fill out the information below to help us diagnose and fix it quickly.
+  - type: dropdown
+    id: module
+    attributes:
+      label: Affected Module
+      description: Which sub-module is experiencing the issue?
+      options:
+        - clippaste (GNOME Extension & Topbar)
+        - clippaste (Rust Daemon)
+        - clippaste (GTK4 GUI)
+        - nautilus-copy-path (C-ABI / Nautilus Integration)
+        - Build / Install Scripts
+        - General / Other
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment Info
+      description: OS version, GNOME Shell version, Display server.
+      placeholder: e.g. Ubuntu 24.04 LTS / GNOME Shell 46.0 / Wayland
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the Bug
+      description: A clear and concise description of what the bug is.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: Step-by-step instructions on how to trigger the bug.
+      placeholder: |
+        1. Open Nautilus...
+        2. Right click on a file...
+        3. See error...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: A clear and concise description of what you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs or Terminal Output
+      description: Please copy and paste any relevant terminal output, journalctl logs, or crash traces.
+      render: shell

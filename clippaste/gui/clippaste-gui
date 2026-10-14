@@ -1,0 +1,749 @@
+#!/usr/bin/env python3
+import sys
+import json
+import os
+import shutil
+import signal
+import socket
+import time
+import atexit
+import subprocess
+
+# If launched in background X11 event-bridge mode (--watch-x11), force GDK X11 backend
+# BEFORE importing Gtk/Gdk so it passively listens to XFixes SelectionNotify events
+# without creating any Wayland window or stealing focus.
+if "--watch-x11" in sys.argv:
+    os.environ["GDK_BACKEND"] = "x11"
+
+import gi
+
+gi.require_version('Gtk', '4.0')
+gi.require_version('GdkPixbuf', '2.0')
+from gi.repository import Gtk, Gdk, GdkPixbuf, Gio, GLib
+
+try:
+    from gi.repository import GLibUnix
+    HAS_GLIB_UNIX = True
+except ImportError:
+    HAS_GLIB_UNIX = False
+
+
+def get_runtime_dir():
+    xdg = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if xdg and os.path.exists(xdg):
+        return os.path.join(xdg, "clippaste")
+    return "/dev/shm/clippaste"
+
+
+def get_pinned_dir():
+    xdg_data = os.environ.get("XDG_DATA_HOME", "").strip()
+    if xdg_data:
+        return os.path.join(xdg_data, "clippaste")
+    return os.path.expanduser("~/.local/share/clippaste")
+
+
+def resolve_daemon_bin():
+    local_bin = os.path.expanduser("~/.local/bin/clippaste-daemon")
+    if os.path.isfile(local_bin) and os.access(local_bin, os.X_OK):
+        return local_bin
+    which_bin = shutil.which("clippaste-daemon")
+    if which_bin:
+        return which_bin
+    return local_bin
+
+
+RUNTIME_DIR = get_runtime_dir()
+SOCKET_PATH = os.path.join(RUNTIME_DIR, "daemon.sock")
+EXT_ACTIVE_FILE = os.path.join(RUNTIME_DIR, "gnome_ext.active")
+PID_FILE = os.path.join(RUNTIME_DIR, "gui.pid")
+HISTORY_FILE = os.path.join(RUNTIME_DIR, "history.json")
+SHM_IMAGES_DIR = os.path.join(RUNTIME_DIR, "images")
+PINNED_IMAGES_DIR = os.path.join(get_pinned_dir(), "pinned_images")
+DAEMON_BIN = resolve_daemon_bin()
+
+_THUMB_CACHE = {}
+
+
+def send_daemon_command(ipc_line, fallback_args):
+    """Send command over Unix domain socket to running daemon without spawning a process."""
+    if os.path.exists(SOCKET_PATH):
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                s.connect(SOCKET_PATH)
+                s.sendall(ipc_line.encode("utf-8"))
+                return True
+        except Exception:
+            pass
+    try:
+        subprocess.run([DAEMON_BIN] + fallback_args, check=False)
+        return True
+    except Exception:
+        return False
+
+
+def run_x11_clipboard_watcher():
+    """
+    Passive, zero-window, event-driven fallback clipboard watcher using XWayland XFixes.
+    Never polls, never calls wl-paste, never opens a popup window, and automatically
+    yields when the native GNOME Shell Extension watcher (gnome_ext.active) is running.
+    """
+    os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
+    try:
+        if hasattr(Gtk, "init_check"):
+            if not Gtk.init_check():
+                sys.exit(0)
+        else:
+            Gtk.init()
+    except Exception:
+        sys.exit(0)
+
+    display = Gdk.Display.get_default()
+    if display is None:
+        sys.exit(0)
+
+    clipboard = display.get_clipboard()
+    debounce_state = {"id": None}
+
+    def stage_and_notify(ipc_action, cli_subcmd, raw_bytes):
+        try:
+            os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
+            staged_path = os.path.join(
+                RUNTIME_DIR, f"staged_x11_{int(time.monotonic() * 1000000)}.bin"
+            )
+            with open(staged_path, "wb") as f:
+                f.write(raw_bytes)
+            send_daemon_command(f"{ipc_action}\t{staged_path}\n", [cli_subcmd, staged_path])
+        except Exception:
+            pass
+
+    def on_texture_ready(clip, result):
+        try:
+            texture = clip.read_texture_finish(result)
+            if texture is not None:
+                png_bytes = texture.save_to_png_bytes().get_data()
+                if png_bytes and len(png_bytes) > 100:
+                    stage_and_notify("INGEST_IMAGE", "ingest-image", png_bytes)
+        except Exception:
+            pass
+
+    def on_text_ready(clip, result):
+        try:
+            text = clip.read_text_finish(result)
+            if text and text.strip():
+                stage_and_notify("INGEST_TEXT", "ingest-text", text.encode("utf-8"))
+        except Exception:
+            pass
+
+    def do_read_clipboard():
+        debounce_state["id"] = None
+        if os.path.exists(EXT_ACTIVE_FILE):
+            return GLib.SOURCE_REMOVE
+
+        formats = clipboard.get_formats()
+        if formats is None:
+            return GLib.SOURCE_REMOVE
+
+        mime_types = formats.get_mime_types() or []
+        if any("password" in m.lower() for m in mime_types):
+            return GLib.SOURCE_REMOVE
+
+        if any(m in mime_types for m in ("image/png", "image/webp", "image/jpeg")):
+            clipboard.read_texture_async(None, on_texture_ready)
+        elif any(
+            m.startswith("text/") or m in ("UTF8_STRING", "STRING") for m in mime_types
+        ):
+            clipboard.read_text_async(None, on_text_ready)
+
+        return GLib.SOURCE_REMOVE
+
+    def on_clipboard_changed(_clip):
+        if os.path.exists(EXT_ACTIVE_FILE):
+            return
+        if debounce_state["id"] is not None:
+            GLib.source_remove(debounce_state["id"])
+        debounce_state["id"] = GLib.timeout_add(90, do_read_clipboard)
+
+    clipboard.connect("changed", on_clipboard_changed)
+    loop = GLib.MainLoop()
+    try:
+        loop.run()
+    except KeyboardInterrupt:
+        pass
+    sys.exit(0)
+
+
+def cleanup_pid():
+    try:
+        if os.path.exists(PID_FILE):
+            with open(PID_FILE, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            if content == str(os.getpid()):
+                os.remove(PID_FILE)
+    except Exception:
+        pass
+
+
+def is_clippaste_gui_process(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmd = f.read().decode("utf-8", errors="ignore")
+            return "clippaste-gui" in cmd and "--watch-x11" not in cmd
+    except Exception:
+        return False
+
+
+def check_and_toggle_instance():
+    os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            if content:
+                pid = int(content)
+                if pid != os.getpid() and is_clippaste_gui_process(pid):
+                    os.kill(pid, signal.SIGTERM)
+                    sys.exit(0)
+        except (ValueError, ProcessLookupError, OSError):
+            try:
+                os.remove(PID_FILE)
+            except OSError:
+                pass
+
+    try:
+        with open(PID_FILE, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+    except Exception:
+        pass
+
+    atexit.register(cleanup_pid)
+
+
+def resolve_file_path(item):
+    path = item.get("file_path")
+    if path and os.path.exists(path):
+        return path
+    item_id = item.get("id")
+    if item_id:
+        for base_dir in (SHM_IMAGES_DIR, PINNED_IMAGES_DIR, "/dev/shm/clippaste/images"):
+            candidate = os.path.join(base_dir, f"{item_id}.png")
+            if os.path.exists(candidate):
+                return candidate
+    return None
+
+
+def get_cached_thumbnail_texture(file_path):
+    try:
+        mtime = os.path.getmtime(file_path)
+        cache_key = (file_path, mtime)
+        if cache_key in _THUMB_CACHE:
+            return _THUMB_CACHE[cache_key]
+
+        pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(file_path, 112, 112, True)
+        texture = Gdk.Texture.new_for_pixbuf(pixbuf)
+        if len(_THUMB_CACHE) > 120:
+            _THUMB_CACHE.clear()
+        _THUMB_CACHE[cache_key] = texture
+        return texture
+    except Exception:
+        return None
+
+
+def create_image_thumbnail(item):
+    container = Gtk.Box()
+    container.set_size_request(56, 56)
+    container.set_halign(Gtk.Align.CENTER)
+    container.set_valign(Gtk.Align.CENTER)
+    container.add_css_class("clippaste-thumb-box")
+
+    file_path = resolve_file_path(item)
+    if file_path:
+        texture = get_cached_thumbnail_texture(file_path)
+        if texture is not None:
+            pic = Gtk.Picture.new_for_paintable(texture)
+            pic.set_content_fit(Gtk.ContentFit.COVER)
+            pic.set_can_shrink(True)
+            pic.set_size_request(56, 56)
+            container.append(pic)
+            return container
+
+    icon = Gtk.Image.new_from_icon_name("image-x-generic-symbolic")
+    icon.set_pixel_size(24)
+    icon.set_valign(Gtk.Align.CENTER)
+    icon.set_vexpand(True)
+    container.append(icon)
+    return container
+
+
+class ClipRow(Gtk.ListBoxRow):
+    def __init__(self, item, on_paste_cb, on_pin_cb, on_delete_cb):
+        super().__init__()
+        self.item = item
+        self.on_paste_cb = on_paste_cb
+        self.on_pin_cb = on_pin_cb
+        self.on_delete_cb = on_delete_cb
+        self.is_dragging = False
+        self.drag_offset_x = 0
+
+        self.set_activatable(True)
+        self.set_selectable(False)
+        self.add_css_class("clippaste-list-row")
+
+        # Main Card Box
+        self.card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.card.add_css_class("clippaste-card")
+        self.set_child(self.card)
+
+        # Image Thumbnail or Text Icon
+        if item.get("item_type") == "image":
+            self.thumb_widget = create_image_thumbnail(item)
+            self.card.append(self.thumb_widget)
+        else:
+            icon_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            icon_box.set_size_request(56, 56)
+            icon_box.set_valign(Gtk.Align.CENTER)
+            icon_box.add_css_class("clippaste-text-icon-box")
+            icon = Gtk.Image.new_from_icon_name("edit-copy-symbolic")
+            icon.set_pixel_size(24)
+            icon.set_valign(Gtk.Align.CENTER)
+            icon.set_vexpand(True)
+            icon_box.append(icon)
+            self.card.append(icon_box)
+
+        # Text labels (Title / Time / Pin status)
+        text_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        text_box.set_valign(Gtk.Align.CENTER)
+        text_box.set_hexpand(True)
+
+        preview_label = Gtk.Label(label=item.get("preview", "(Trống)"), xalign=0)
+        preview_label.set_ellipsize(3)  # PANGO_ELLIPSIZE_END
+        preview_label.set_max_width_chars(32)
+        preview_label.add_css_class("clippaste-title")
+        text_box.append(preview_label)
+
+        sub_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        if item.get("is_pinned"):
+            pin_badge = Gtk.Label(label="📌 Đã ghim")
+            pin_badge.add_css_class("clippaste-pin-badge")
+            sub_box.append(pin_badge)
+
+        time_label = Gtk.Label(label=item.get("time_str", ""))
+        time_label.add_css_class("clippaste-time")
+        sub_box.append(time_label)
+
+        text_box.append(sub_box)
+        self.card.append(text_box)
+
+        # Actions Box
+        actions_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        actions_box.set_valign(Gtk.Align.CENTER)
+
+        # Pin button
+        self.pin_btn = Gtk.Button()
+        pin_icon = Gtk.Image.new_from_icon_name("view-pin-symbolic")
+        pin_icon.set_pixel_size(16)
+        self.pin_btn.set_child(pin_icon)
+        self.pin_btn.set_tooltip_text(
+            "Bỏ ghim" if item.get("is_pinned") else "Ghim không bị mất khi reset máy"
+        )
+        if item.get("is_pinned"):
+            self.pin_btn.add_css_class("btn-pinned")
+        else:
+            self.pin_btn.add_css_class("btn-action")
+        self.pin_btn.connect("clicked", lambda b: self.on_pin_cb(self.item))
+        actions_box.append(self.pin_btn)
+
+        # Delete button (trash)
+        del_btn = Gtk.Button()
+        del_icon = Gtk.Image.new_from_icon_name("user-trash-symbolic")
+        del_icon.set_pixel_size(16)
+        del_btn.set_child(del_icon)
+        del_btn.set_tooltip_text("Xóa dòng này (hoặc vuốt sang trái)")
+        del_btn.add_css_class("btn-action")
+        del_btn.add_css_class("btn-delete")
+        del_btn.connect("clicked", lambda b: self.on_delete_cb(self.item))
+        actions_box.append(del_btn)
+
+        self.card.append(actions_box)
+
+        # Swipe gesture (Right-to-Left drag to delete)
+        self.drag_gesture = Gtk.GestureDrag()
+        self.drag_gesture.connect("drag-update", self.on_drag_update)
+        self.drag_gesture.connect("drag-end", self.on_drag_end)
+        self.add_controller(self.drag_gesture)
+
+    def on_drag_update(self, gesture, offset_x, offset_y):
+        if abs(offset_x) > 8 and abs(offset_x) > abs(offset_y):
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+            self.is_dragging = True
+
+        if offset_x < -4:
+            self.drag_offset_x = offset_x
+            self.card.set_margin_start(int(offset_x))
+            self.card.set_margin_end(int(-offset_x))
+            if offset_x < -70:
+                self.card.add_css_class("card-swiping-delete")
+            else:
+                self.card.remove_css_class("card-swiping-delete")
+        elif self.is_dragging:
+            self.drag_offset_x = 0
+            self.card.set_margin_start(0)
+            self.card.set_margin_end(0)
+            self.card.remove_css_class("card-swiping-delete")
+
+    def on_drag_end(self, gesture, offset_x, offset_y):
+        should_delete = self.drag_offset_x < -80
+        self.drag_offset_x = 0
+        self.card.set_margin_start(0)
+        self.card.set_margin_end(0)
+        self.card.remove_css_class("card-swiping-delete")
+
+        if should_delete:
+            self.on_delete_cb(self.item)
+
+        GLib.idle_add(self._clear_drag_flag)
+
+    def _clear_drag_flag(self):
+        self.is_dragging = False
+        return GLib.SOURCE_REMOVE
+
+
+class ClipPasteWindow(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="ClipPaste (Bộ nhớ tạm)")
+        self.set_default_size(440, 560)
+
+        self.apply_css()
+
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        main_box.set_margin_top(14)
+        main_box.set_margin_bottom(14)
+        main_box.set_margin_start(14)
+        main_box.set_margin_end(14)
+        self.set_child(main_box)
+
+        # Header bar
+        header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        title_label = Gtk.Label(label="<b>📋 ClipPaste</b>", use_markup=True, xalign=0)
+        title_label.set_hexpand(True)
+        header_box.append(title_label)
+
+        help_label = Gtk.Label(
+            label="<small>Click dòng để dán • Vuốt trái để xóa</small>", use_markup=True
+        )
+        help_label.add_css_class("clippaste-hint")
+        header_box.append(help_label)
+
+        clear_btn = Gtk.Button(label="Xóa tạm")
+        clear_btn.set_tooltip_text("Xóa các mục chưa ghim trong RAM")
+        clear_btn.connect("clicked", self.on_clear_clicked)
+        clear_btn.add_css_class("btn-clear-temp")
+        header_box.append(clear_btn)
+        main_box.append(header_box)
+
+        # Search Entry
+        self.search_entry = Gtk.SearchEntry()
+        self.search_entry.set_placeholder_text("Tìm kiếm nội dung đã copy...")
+        self.search_entry.connect("search-changed", self.on_search_changed)
+        main_box.append(self.search_entry)
+
+        # Scrolled Window
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_vexpand(True)
+        scrolled.set_hexpand(True)
+        main_box.append(scrolled)
+
+        # ListBox
+        self.list_box = Gtk.ListBox()
+        self.list_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.list_box.connect("row-activated", self.on_row_activated)
+        scrolled.set_child(self.list_box)
+
+        # Escape key
+        key_controller = Gtk.EventControllerKey()
+        key_controller.connect("key-pressed", self.on_key_pressed)
+        self.add_controller(key_controller)
+
+        self.items = []
+        self._reload_debounce_id = None
+        self.setup_file_monitor()
+        self.load_and_populate()
+
+    def setup_file_monitor(self):
+        try:
+            os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
+            gfile = Gio.File.new_for_path(HISTORY_FILE)
+            self._file_monitor = gfile.monitor_file(Gio.FileMonitorFlags.NONE, None)
+            self._file_monitor.connect("changed", self.on_history_file_changed)
+        except Exception:
+            self._file_monitor = None
+
+    def on_history_file_changed(self, monitor, file, other_file, event_type):
+        if event_type in (
+            Gio.FileMonitorEvent.CHANGED,
+            Gio.FileMonitorEvent.CHANGES_DONE_HINT,
+            Gio.FileMonitorEvent.CREATED,
+            Gio.FileMonitorEvent.MOVED_IN,
+        ):
+            if self._reload_debounce_id is not None:
+                GLib.source_remove(self._reload_debounce_id)
+            self._reload_debounce_id = GLib.timeout_add(80, self._debounced_reload)
+
+    def _debounced_reload(self):
+        self._reload_debounce_id = None
+        self.load_and_populate(self.search_entry.get_text())
+        return GLib.SOURCE_REMOVE
+
+    def apply_css(self):
+        css_provider = Gtk.CssProvider()
+        css = b"""
+        .clippaste-list-row {
+            background: transparent;
+            padding: 4px 2px;
+        }
+
+        .clippaste-card {
+            background-color: #2b2b2b;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 10px;
+            padding: 8px 12px;
+        }
+
+        .clippaste-card:hover {
+            background-color: #383838;
+            border-color: rgba(255, 255, 255, 0.18);
+        }
+
+        .card-swiping-delete {
+            background-color: #7a1b1b;
+            border-color: #e01b24;
+        }
+
+        .clippaste-thumb-box {
+            min-width: 56px;
+            min-height: 56px;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            background-color: #1a1a1a;
+        }
+
+        .clippaste-text-icon-box {
+            min-width: 56px;
+            min-height: 56px;
+            background-color: rgba(255, 255, 255, 0.06);
+            border-radius: 8px;
+        }
+
+        .clippaste-title {
+            font-size: 13.5px;
+            font-weight: 500;
+            color: #ffffff;
+        }
+
+        .clippaste-time {
+            font-size: 11px;
+            color: #8e8e8e;
+        }
+
+        .clippaste-hint {
+            color: #8e8e8e;
+        }
+
+        .clippaste-pin-badge {
+            font-size: 11px;
+            font-weight: 600;
+            color: #3584e4;
+            background-color: rgba(53, 132, 228, 0.18);
+            border-radius: 4px;
+            padding: 1px 6px;
+        }
+
+        .btn-action {
+            background-color: rgba(255, 255, 255, 0.06);
+            color: #d0d0d0;
+            border-radius: 20px;
+            padding: 6px;
+            min-width: 32px;
+            min-height: 32px;
+        }
+
+        .btn-action:hover {
+            background-color: rgba(255, 255, 255, 0.18);
+            color: #ffffff;
+        }
+
+        .btn-pinned {
+            background-color: #3584e4;
+            color: #ffffff;
+            border-radius: 20px;
+            padding: 6px;
+            min-width: 32px;
+            min-height: 32px;
+        }
+
+        .btn-pinned:hover {
+            background-color: #1d72d6;
+        }
+
+        .btn-delete:hover {
+            background-color: #e01b24;
+            color: #ffffff;
+        }
+
+        .btn-clear-temp {
+            border-radius: 6px;
+            padding: 4px 10px;
+        }
+        """
+        css_provider.load_from_data(css)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
+            css_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+
+    def on_key_pressed(self, controller, keyval, keycode, state):
+        if keyval == Gdk.KEY_Escape:
+            self.close()
+            return True
+        return False
+
+    def load_history(self):
+        for candidate in (HISTORY_FILE, "/dev/shm/clippaste/history.json"):
+            if os.path.exists(candidate):
+                try:
+                    with open(candidate, "r", encoding="utf-8") as f:
+                        return json.load(f)
+                except Exception:
+                    continue
+        return []
+
+    def load_and_populate(self, query=""):
+        self.items = self.load_history()
+
+        child = self.list_box.get_first_child()
+        while child:
+            next_child = child.get_next_sibling()
+            self.list_box.remove(child)
+            child = next_child
+
+        filter_q = query.strip().lower()
+        filtered = [
+            i
+            for i in self.items
+            if not filter_q
+            or (
+                i.get("preview", "").lower().find(filter_q) != -1
+                or (i.get("content") and i.get("content").lower().find(filter_q) != -1)
+            )
+        ]
+
+        if not filtered:
+            empty_row = Gtk.ListBoxRow()
+            empty_label = Gtk.Label(
+                label="<i>Chưa có nội dung copy tạm</i>", use_markup=True
+            )
+            empty_label.set_margin_top(28)
+            empty_label.set_margin_bottom(28)
+            empty_row.set_child(empty_label)
+            empty_row.set_activatable(False)
+            self.list_box.append(empty_row)
+            return
+
+        for item in filtered:
+            row = ClipRow(
+                item,
+                on_paste_cb=self.paste_item,
+                on_pin_cb=self.pin_item,
+                on_delete_cb=self.delete_item,
+            )
+            self.list_box.append(row)
+
+    def on_search_changed(self, entry):
+        self.load_and_populate(entry.get_text())
+
+    def on_row_activated(self, list_box, row):
+        if isinstance(row, ClipRow):
+            if getattr(row, "is_dragging", False):
+                return
+            self.paste_item(row.item)
+
+    def paste_item(self, item):
+        item_id = item.get("id")
+        self.set_visible(False)
+        self.close()
+        if not send_daemon_command(f"PASTE\t{item_id}\n", ["paste", str(item_id)]):
+            try:
+                subprocess.Popen(
+                    [DAEMON_BIN, "paste", str(item_id)],
+                    start_new_session=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as e:
+                sys.stderr.write(f"ClipPaste failed to run daemon paste: {e}\n")
+
+    def pin_item(self, item):
+        item_id = item.get("id")
+        send_daemon_command(f"PIN\t{item_id}\n", ["pin", str(item_id)])
+        self.load_and_populate(self.search_entry.get_text())
+
+    def delete_item(self, item):
+        item_id = item.get("id")
+        send_daemon_command(f"DELETE\t{item_id}\n", ["delete", str(item_id)])
+        self.load_and_populate(self.search_entry.get_text())
+
+    def on_clear_clicked(self, btn):
+        send_daemon_command("CLEAR\n", ["clear"])
+        _THUMB_CACHE.clear()
+        self.load_and_populate(self.search_entry.get_text())
+
+
+class ClipPasteApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(
+            application_id=None,
+            flags=Gio.ApplicationFlags.NON_UNIQUE,
+        )
+        self.win = None
+
+    def do_activate(self):
+        self.win = ClipPasteWindow(self)
+        self.win.connect("destroy", self.on_window_destroy)
+        self.win.present()
+        try:
+            if HAS_GLIB_UNIX:
+                GLibUnix.signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, self.on_sigterm)
+                GLibUnix.signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, self.on_sigterm)
+            elif hasattr(GLib, "unix_signal_add"):
+                GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, self.on_sigterm)
+                GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, self.on_sigterm)
+        except Exception:
+            pass
+
+    def on_sigterm(self):
+        cleanup_pid()
+        self.quit()
+        return GLib.SOURCE_REMOVE
+
+    def on_window_destroy(self, win):
+        cleanup_pid()
+        self.win = None
+        self.quit()
+
+
+def main():
+    if "--watch-x11" in sys.argv:
+        run_x11_clipboard_watcher()
+        return
+
+    check_and_toggle_instance()
+    app = ClipPasteApp()
+    try:
+        app.run(sys.argv)
+    finally:
+        cleanup_pid()
+
+
+if __name__ == "__main__":
+    main()

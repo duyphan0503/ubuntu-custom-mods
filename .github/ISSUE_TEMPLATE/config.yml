@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Ask Questions & Discussion
+    url: https://github.com/duyphan0503/ubuntu-custom-mods/discussions
+    about: Ask questions, share ideas, or get community assistance.
+  - name: 🔒 Security Incident Report
+    url: mailto:quyettu347@gmail.com
+    about: Report sensitive security vulnerabilities directly to the maintainer.

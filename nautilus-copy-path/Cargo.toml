@@ -1,0 +1,21 @@
+[package]
+name = "nautilus-copy-path"
+version = "0.1.0"
+edition = "2021"
+authors = ["dp"]
+description = "Ultra-fast native Copy Path extension for Nautilus on Ubuntu"
+
+[lib]
+name = "copypath"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "copy-path"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,7 @@
+{
+  "uuid": "clippaste@dp.mod",
+  "name": "ClipPaste",
+  "description": "ClipPaste temporary text & image clipboard manager for Ubuntu",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "version": 1
+}

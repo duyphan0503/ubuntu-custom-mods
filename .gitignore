@@ -1,0 +1,41 @@
+# Rust build outputs
+**/target/
+**/*.rs.bk
+*.rlib
+*.so
+*.dylib
+*.dll
+
+# Cargo
+Cargo.lock.backup
+
+# Python / GTK cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# GNOME / Linux Desktop temporary files
+*.tmp
+*.bak
+*~
+.directory
+.DS_Store
+
+# Logs & Crash dumps
+*.log
+core
+core.*
+
+# IDE and Editor configurations
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example

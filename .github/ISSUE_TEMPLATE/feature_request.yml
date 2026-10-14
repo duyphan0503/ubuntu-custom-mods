@@ -1,0 +1,41 @@
+name: 💡 Feature Request
+description: Propose a new idea or improvement for ubuntu-custom-mods
+title: "[FEAT]: "
+labels: ["enhancement", "proposal"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have an idea to make desktop Linux on Ubuntu even smoother or more powerful? We'd love to hear it!
+  - type: dropdown
+    id: module
+    attributes:
+      label: Target Module
+      description: Which part of the project would this feature affect?
+      options:
+        - clippaste
+        - nautilus-copy-path
+        - New custom module idea
+        - Developer Experience / Tooling
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: Is your feature request related to a specific workflow friction or problem?
+      placeholder: "I'm always frustrated when..."
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: A clear and concise description of what you want to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Any alternative solutions, workarounds, or external tools you've evaluated.
